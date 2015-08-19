@@ -4,6 +4,7 @@ Submit an Analysis
 
     * :ref:`submitpy`
     * :ref:`apipy`
+    * :ref:`distpy`
     * :ref:`webpy`
     * :ref:`python`
 
@@ -15,31 +16,45 @@ Submission Utility
 The easiest way to submit an analysis is to use the provided *submit.py*
 command-line utility. It currently has the following options available::
 
-    usage: submit.py [-h] [--url] [--package PACKAGE] [--custom CUSTOM]
-                     [--timeout TIMEOUT] [--options OPTIONS] [--priority PRIORITY]
-                     [--machine MACHINE] [--platform PLATFORM] [--memory]
-                     [--enforce-timeout]
+    usage: submit.py [-h] [-d] [--remote REMOTE] [--url] [--package PACKAGE]
+                     [--custom CUSTOM] [--owner OWNER] [--timeout TIMEOUT]
+                     [-o OPTIONS] [--priority PRIORITY] [--machine MACHINE]
+                     [--platform PLATFORM] [--memory] [--enforce-timeout]
+                     [--clock CLOCK] [--tags TAGS] [--max MAX] [--pattern PATTERN]
+                     [--shuffle] [--unique] [--quiet]
                      target
 
     positional arguments:
-      target               URL, path to the file or folder to analyze
+      target                URL, path to the file or folder to analyze
 
     optional arguments:
-      -h, --help           show this help message and exit
-      --url                Specify whether the target is an URL
-      --package PACKAGE    Specify an analysis package
-      --custom CUSTOM      Specify any custom value
-      --timeout TIMEOUT    Specify an analysis timeout
-      --options OPTIONS    Specify options for the analysis package (e.g.
-                           "name=value,name2=value2")
-      --priority PRIORITY  Specify a priority for the analysis represented by an
-                           integer
-      --machine MACHINE    Specify the identifier of a machine you want to use
-      --platform PLATFORM  Specify the operating system platform you want to use
-                           (windows/darwin/linux)
-      --memory             Enable to take a memory dump of the analysis machine
-      --enforce-timeout    Enable to force the analysis to run for the full
-                           timeout period
+      -h, --help            show this help message and exit
+      -d, --debug           Enable debug logging
+      --remote REMOTE       Specify IP:port to a Cuckoo API server to submit
+                            remotely
+      --url                 Specify whether the target is an URL
+      --package PACKAGE     Specify an analysis package
+      --custom CUSTOM       Specify any custom value
+      --owner OWNER         Specify the task owner
+      --timeout TIMEOUT     Specify an analysis timeout
+      -o OPTIONS, --options OPTIONS
+                            Specify options for the analysis package (e.g.
+                            "name=value,name2=value2")
+      --priority PRIORITY   Specify a priority for the analysis represented by an
+                            integer
+      --machine MACHINE     Specify the identifier of a machine you want to use
+      --platform PLATFORM   Specify the operating system platform you want to use
+                            (windows/darwin/linux)
+      --memory              Enable to take a memory dump of the analysis machine
+      --enforce-timeout     Enable to force the analysis to run for the full
+                            timeout period
+      --clock CLOCK         Set virtual machine clock
+      --tags TAGS           Specify tags identifier of a machine you want to use
+      --max MAX             Maximum samples to add in a row
+      --pattern PATTERN     Pattern of files to submit
+      --shuffle             Shuffle samples before submitting them
+      --unique              Only submit new samples, ignore duplicates
+      --quiet               Only print text on failure
 
 If you specify a directory as path, all the files contained in it will be
 submitted for analysis.
@@ -68,7 +83,7 @@ The concept of analysis packages will be dealt later in this documentation (at
 
     $ ./utils/submit.py --package <name of package> /path/to/binary
 
-*Example*: submit a local binary and specify a custom analysis package and 
+*Example*: submit a local binary and specify a custom analysis package and
 some options (in this case a command line argument for the malware)::
 
     $ ./utils/submit.py --package exe --options arguments=--dosomething /path/to/binary.exe
@@ -89,6 +104,27 @@ some options (in this case a command line argument for the malware)::
 
     $ ./utils/submit.py --enforce-timeout /path/to/binary
 
+*Example*: submit a local binary and set virtual machine clock. Format is %m-%d-%Y %H:%M:%S. If not specified, the current time is used. For example if we want run a sample the 24 january 2001 at 14:41:20::
+
+    $ ./utils/submit.py --clock "01-24-2001 14:41:20" /path/to/binary
+
+*Example*: submit a sample for Volatility analysis (to reduce side effects of the cuckoo hooking, switch it off with *options free=True*)::
+
+    $ ./utils/submit.py --memory --options free=True /path/to/binary
+
+.. _webpy:
+
+web.py
+======
+
+Cuckoo provides a very small utility under ``utils/web.py``, which will bind a simple
+webserver on localhost port 8080, through which you will be able to browse through
+existing reports as well as submit new files.
+
+Beware that this is not a full-fledged web interface, which is instead provided
+under the folder ``web/`` as a Django-powered application. You can find more details
+about that under :doc:`web`.
+
 .. _apipy:
 
 API
@@ -96,35 +132,13 @@ API
 
 Detailed usage of the REST API interface is described in :doc:`api`.
 
-.. _webpy:
+.. _distpy:
 
-Web Utility
-===========
+Distributed Cuckoo
+==================
 
-Cuckoo provides a very basic web utility that you can use to submit files to
-be analyzed.
-
-You can find the script at path *utils/web.py* and you can start it with::
-
-    $ python utils/web.py
-
-By default it will create a webserver on localhost and port 8080. Open your
-browser at *http://localhost:8080* and it will prompt you a simple form that
-allows you to upload a file, specify some options (with the same format as
-the *submit.py* utility) and submit it.
-
-In the *Browse* section you can track the status of pending, failed and
-succeeded analyses and, when available, you'll be prompted a link to view
-the HTML report.
-
-    .. note::
-
-        This is by no means supposed to be a full fledged web interface:
-        it's a very simple utility that we put together to allow users to
-        simply upload files and consumes the generated HTML report.
-        Despite being incorporated and rendered dynamically, the results
-        displayed are nothing else than the *report.html* file, therefore
-        it is supposed to be independent from the utility.
+Detailed usage of the Distributed Cuckoo API interface is described in
+:doc:`dist`.
 
 .. _python:
 
@@ -137,10 +151,10 @@ use SQLite, MySQL, PostgreSQL and several other SQL database systems.
 
 Cuckoo is designed to be easily integrated in larger solutions and to be fully
 automated. In order to automate analysis submission we suggest to use the REST
-API interface described in :doc:`api`, but in the case you want to write your
-own Python submission script, you can use the ``add_path()`` and ``add_url()`` functions.
+API interface described in :doc:`api`, but in case you want to write your
+own Python submission script, you can also use the ``add_path()`` and ``add_url()`` functions.
 
-.. function:: add_path(file_path[, timeout=0[, package=None[, options=None[, priority=1[, custom=None[, machine=None[, platform=None[, memory=False[, enforce_timeout=False]]]]]]]]])
+.. function:: add_path(file_path[, timeout=0[, package=None[, options=None[, priority=1[, custom=None[, owner=""[, machine=None[, platform=None[, memory=False[, enforce_timeout=False], clock=None[]]]]]]]]]])
 
     Add a local file to the list of pending analysis tasks. Returns the ID of the newly generated task.
 
@@ -156,14 +170,18 @@ own Python submission script, you can use the ``add_path()`` and ``add_url()`` f
     :type priority: integer
     :param custom: custom value to be passed over and possibly reused at processing or reporting
     :type custom: string or None
+    :param owner: task owner
+    :type owner: string or None
     :param machine: Cuckoo identifier of the virtual machine you want to use, if none is specified one will be selected automatically
     :type machine: string or None
     :param platform: operating system platform you want to run the analysis one (currently only Windows)
     :type platform: string or None
     :param memory: set to ``True`` to generate a full memory dump of the analysis machine
     :type memory: True or False
-    :param enforce_timeout: set to ``True`` to force the executuion for the full timeout
+    :param enforce_timeout: set to ``True`` to force the execution for the full timeout
     :type enforce_timeout: True or False
+    :param clock: provide a custom clock time to set in the analysis machine
+    :type clock: string or None
     :rtype: integer
 
     Example usage:
@@ -175,9 +193,9 @@ own Python submission script, you can use the ``add_path()`` and ``add_url()`` f
         >>> db = Database()
         >>> db.add_path("/tmp/malware.exe")
         1
-        >>> 
+        >>>
 
-.. function:: add_url(url[, timeout=0[, package=None[, options=None[, priority=1[, custom=None[, machine=None[, platform=None[, memory=False[, enforce_timeout=False]]]]]]]]])
+.. function:: add_url(url[, timeout=0[, package=None[, options=None[, priority=1[, custom=None[, owner=""[, machine=None[, platform=None[, memory=False[, enforce_timeout=False], clock=None[]]]]]]]]]])
 
     Add a local file to the list of pending analysis tasks. Returns the ID of the newly generated task.
 
@@ -193,14 +211,18 @@ own Python submission script, you can use the ``add_path()`` and ``add_url()`` f
     :type priority: integer
     :param custom: custom value to be passed over and possibly reused at processing or reporting
     :type custom: string or None
+    :param owner: task owner
+    :type owner: string or None
     :param machine: Cuckoo identifier of the virtual machine you want to use, if none is specified one will be selected automatically
     :type machine: string or None
     :param platform: operating system platform you want to run the analysis one (currently only Windows)
     :type platform: string or None
     :param memory: set to ``True`` to generate a full memory dump of the analysis machine
     :type memory: True or False
-    :param enforce_timeout: set to ``True`` to force the executuion for the full timeout
+    :param enforce_timeout: set to ``True`` to force the execution for the full timeout
     :type enforce_timeout: True or False
+    :param clock: provide a custom clock time to set in the analysis machine
+    :type clock: string or None
     :rtype: integer
 
 Example Usage:
@@ -212,6 +234,6 @@ Example Usage:
     >>> db = Database()
     >>> db.add_url("http://www.cuckoosandbox.org")
     2
-    >>> 
+    >>>
 
 .. _`SQLAlchemy`: http://www.sqlalchemy.org

@@ -1,33 +1,32 @@
-# Copyright (C) 2010-2013 Cuckoo Sandbox Developers.
+# Copyright (C) 2010-2015 Cuckoo Foundation.
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-import os
-import sys
-import hashlib
 import binascii
+import hashlib
 import logging
-from datetime import datetime
+import os
+import subprocess
+
+from lib.cuckoo.common.constants import CUCKOO_ROOT
 
 try:
     import magic
+    HAVE_MAGIC = True
 except ImportError:
-    pass
+    HAVE_MAGIC = False
 
 try:
     import pydeep
-    HAVE_SSDEEP = True
+    HAVE_PYDEEP = True
 except ImportError:
-    HAVE_SSDEEP = False
+    HAVE_PYDEEP = False
 
 try:
     import yara
     HAVE_YARA = True
 except ImportError:
     HAVE_YARA = False
-
-from lib.cuckoo.common.utils import convert_to_printable
-from lib.cuckoo.common.constants import CUCKOO_ROOT
 
 log = logging.getLogger(__name__)
 
@@ -49,8 +48,16 @@ class URL:
         """@param url: URL"""
         self.url = url
 
-class File:
+class File(object):
     """Basic file object class with all useful utilities."""
+
+    YARA_RULEPATH = \
+        os.path.join(CUCKOO_ROOT, "data", "yara", "index_binaries.yar")
+
+    # static fields which indicate whether the user has been
+    # notified about missing dependencies already
+    notified_yara = False
+    notified_pydeep = False
 
     def __init__(self, file_path):
         """@param file_path: file path."""
@@ -58,11 +65,11 @@ class File:
 
         # these will be populated when first accessed
         self._file_data = None
-        self._crc32     = None
-        self._md5       = None
-        self._sha1      = None
-        self._sha256    = None
-        self._sha512    = None
+        self._crc32 = None
+        self._md5 = None
+        self._sha1 = None
+        self._sha256 = None
+        self._sha512 = None
 
     def get_name(self):
         """Get file name.
@@ -85,21 +92,21 @@ class File:
     def get_chunks(self):
         """Read file contents in chunks (generator)."""
 
-        fd = open(self.file_path, "rb")
-        while True:
-            chunk = fd.read(FILE_CHUNK_SIZE)
-            if not chunk: break
-            yield chunk
-        fd.close()
+        with open(self.file_path, "rb") as fd:
+            while True:
+                chunk = fd.read(FILE_CHUNK_SIZE)
+                if not chunk:
+                    break
+                yield chunk
 
     def calc_hashes(self):
         """Calculate all possible hashes for this file."""
-        crc     = 0
-        md5     = hashlib.md5()
-        sha1    = hashlib.sha1()
-        sha256  = hashlib.sha256()
-        sha512  = hashlib.sha512()
-        
+        crc = 0
+        md5 = hashlib.md5()
+        sha1 = hashlib.sha1()
+        sha256 = hashlib.sha256()
+        sha512 = hashlib.sha512()
+
         for chunk in self.get_chunks():
             crc = binascii.crc32(chunk, crc)
             md5.update(chunk)
@@ -107,16 +114,17 @@ class File:
             sha256.update(chunk)
             sha512.update(chunk)
 
-        self._crc32     = "".join("%02X" % ((crc>>i)&0xff) for i in [24, 16, 8, 0])
-        self._md5       = md5.hexdigest()
-        self._sha1      = sha1.hexdigest()
-        self._sha256    = sha256.hexdigest()
-        self._sha512    = sha512.hexdigest()
+        self._crc32 = "".join("%02X" % ((crc >> i) & 0xff)
+                              for i in [24, 16, 8, 0])
+        self._md5 = md5.hexdigest()
+        self._sha1 = sha1.hexdigest()
+        self._sha256 = sha256.hexdigest()
+        self._sha512 = sha512.hexdigest()
 
     @property
     def file_data(self):
-        log.warning("Usage of File.file_data is deprecated, use chunks of files only.")
-        if not self._file_data: self._file_data = open(self.file_path, "rb").read()
+        if not self._file_data:
+            self._file_data = open(self.file_path, "rb").read()
         return self._file_data
 
     def get_size(self):
@@ -129,28 +137,32 @@ class File:
         """Get CRC32.
         @return: CRC32.
         """
-        if not self._crc32: self.calc_hashes()
+        if not self._crc32:
+            self.calc_hashes()
         return self._crc32
 
     def get_md5(self):
         """Get MD5.
         @return: MD5.
         """
-        if not self._md5: self.calc_hashes()
+        if not self._md5:
+            self.calc_hashes()
         return self._md5
 
     def get_sha1(self):
         """Get SHA1.
         @return: SHA1.
         """
-        if not self._sha1: self.calc_hashes()
+        if not self._sha1:
+            self.calc_hashes()
         return self._sha1
 
     def get_sha256(self):
         """Get SHA256.
         @return: SHA256.
         """
-        if not self._sha256: self.calc_hashes()
+        if not self._sha256:
+            self.calc_hashes()
         return self._sha256
 
     def get_sha512(self):
@@ -158,14 +170,18 @@ class File:
         Get SHA512.
         @return: SHA512.
         """
-        if not self._sha512: self.calc_hashes()
+        if not self._sha512:
+            self.calc_hashes()
         return self._sha512
 
     def get_ssdeep(self):
         """Get SSDEEP.
         @return: SSDEEP.
         """
-        if not HAVE_SSDEEP:
+        if not HAVE_PYDEEP:
+            if not File.notified_pydeep:
+                File.notified_pydeep = True
+                log.warning("Unable to import pydeep (install with `pip install pydeep`)")
             return None
 
         try:
@@ -177,62 +193,137 @@ class File:
         """Get MIME file type.
         @return: file type.
         """
-        try:
-            ms = magic.open(magic.MAGIC_NONE)
-            ms.load()
-            file_type = ms.file(self.file_path)
-        except:
+        file_type = None
+        if HAVE_MAGIC:
             try:
-                file_type = magic.from_file(self.file_path)
+                ms = magic.open(magic.MAGIC_NONE)
+                ms.load()
+                file_type = ms.file(self.file_path)
             except:
                 try:
-                    import subprocess
-                    file_process = subprocess.Popen(["file",
-                                                     "-b",
-                                                     self.file_path],
-                                                    stdout = subprocess.PIPE)
-                    file_type = file_process.stdout.read().strip()
+                    file_type = magic.from_file(self.file_path)
                 except:
-                    return ""
-        finally:
+                    pass
+            finally:
+                try:
+                    ms.close()
+                except:
+                    pass
+
+        if file_type is None:
             try:
-                ms.close()
+                p = subprocess.Popen(["file", "-b", self.file_path],
+                                     stdout=subprocess.PIPE)
+                file_type = p.stdout.read().strip()
             except:
                 pass
 
         return file_type
 
-    def get_yara(self, rulepath=os.path.join(CUCKOO_ROOT, "data", "yara", "index.yar")):
+    def get_content_type(self):
+        """Get MIME content file type (example: image/jpeg).
+        @return: file content type.
+        """
+        file_type = None
+        if HAVE_MAGIC:
+            try:
+                ms = magic.open(magic.MAGIC_MIME)
+                ms.load()
+                file_type = ms.file(self.file_path)
+            except:
+                try:
+                    file_type = magic.from_file(self.file_path, mime=True)
+                except:
+                    pass
+            finally:
+                try:
+                    ms.close()
+                except:
+                    pass
+
+        if file_type is None:
+            try:
+                p = subprocess.Popen(["file", "-b", "--mime-type", self.file_path],
+                                     stdout=subprocess.PIPE)
+                file_type = p.stdout.read().strip()
+            except:
+                pass
+
+        return file_type
+
+    def _yara_encode_string(self, s):
+        # Beware, spaghetti code ahead.
+        try:
+            new = s.encode("utf-8")
+        except UnicodeDecodeError:
+            s = s.lstrip("uU").encode("hex").upper()
+            s = " ".join(s[i:i+2] for i in range(0, len(s), 2))
+            new = "{ %s }" % s
+
+        return new
+
+    def _yara_matches_177(self, matches):
+        """Extract matches from the Yara output for version 1.7.7."""
+        ret = []
+        for _, rule_matches in matches.items():
+            for match in rule_matches:
+                strings = set()
+
+                for s in match["strings"]:
+                    strings.add(self._yara_encode_string(s["data"]))
+
+                ret.append({
+                    "name": match["rule"],
+                    "meta": match["meta"],
+                    "strings": list(strings),
+                })
+
+        return ret
+
+    def get_yara(self, rulepath=YARA_RULEPATH):
         """Get Yara signatures matches.
         @return: matched Yara signatures.
         """
-        matches = []
+        results = []
 
-        if HAVE_YARA:
-            try:
-                rules = yara.compile(rulepath)
+        if not HAVE_YARA:
+            if not File.notified_yara:
+                File.notified_yara = True
+                log.warning("Unable to import yara (please compile from sources)")
+            return results
 
-                for match in rules.match(self.file_path):
-                    strings = []
-                    for s in match.strings:
-                        # Beware, spaghetti code ahead.
-                        try:
-                            new = s[2].encode("utf-8")
-                        except UnicodeDecodeError:
-                            s = s[2].lstrip("uU").encode("hex").upper()
-                            s = " ".join(s[i:i+2] for i in range(0, len(s), 2))
-                            new = "{ %s }" % s
+        if not os.path.exists(rulepath):
+            log.warning("The specified rule file at %s doesn't exist, skip",
+                        rulepath)
+            return results
 
-                        if new not in strings:
-                            strings.append(new)
+        if not os.path.getsize(self.file_path):
+            return results
 
-                    matches.append({"name" : match.rule,
-                                    "meta" : match.meta,
-                                    "strings" : strings})
-            except yara.Error as e:
-                log.warning("Unable to match Yara signatures: %s", e)
+        try:
+            rules = yara.compile(rulepath)
+            matches = rules.match(self.file_path)
 
-        return matches
+            if getattr(yara, "__version__", None) == "1.7.7":
+                return self._yara_matches_177(matches)
+
+            results = []
+
+            for match in matches:
+                strings = set()
+                for s in match.strings:
+                    strings.add(self._yara_encode_string(s[2]))
+
+                results.append({
+                    "name": match.rule,
+                    "meta": match.meta,
+                    "strings": list(strings),
+                })
+
+        except Exception as e:
+            log.exception("Unable to match Yara signatures: %s", e)
+
+        return results
 
     def get_all(self):
         """Get all information available.
@@ -250,5 +341,4 @@ class File:
         infos["ssdeep"] = self.get_ssdeep()
         infos["type"] = self.get_type()
         infos["yara"] = self.get_yara()
-
         return infos

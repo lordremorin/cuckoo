@@ -1,7 +1,8 @@
-# Copyright (C) 2010-2013 Cuckoo Sandbox Developers.
+# Copyright (C) 2010-2015 Cuckoo Foundation.
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
+import os.path
 import re
 
 from lib.cuckoo.common.abstracts import Processing
@@ -18,10 +19,14 @@ class Strings(Processing):
         strings = []
 
         if self.task["category"] == "file":
+            if not os.path.exists(self.file_path):
+                raise CuckooProcessingError("Sample file doesn't exist: \"%s\"" % self.file_path)
+
             try:
                 data = open(self.file_path, "r").read()
             except (IOError, OSError) as e:
                 raise CuckooProcessingError("Error opening file %s" % e)
             strings = re.findall("[\x1f-\x7e]{6,}", data)
+            strings += [str(ws.decode("utf-16le")) for ws in re.findall("(?:[\x1f-\x7e][\x00]){6,}", data)]
 
         return strings

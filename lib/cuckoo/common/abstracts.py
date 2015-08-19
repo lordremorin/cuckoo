@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2013 Cuckoo Sandbox Developers.
+# Copyright (C) 2010-2015 Cuckoo Foundation.
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
@@ -7,6 +7,9 @@ import re
 import logging
 import time
 
+import xml.etree.ElementTree as ET
+
+from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.exceptions import CuckooCriticalError
 from lib.cuckoo.common.exceptions import CuckooMachineError
 from lib.cuckoo.common.exceptions import CuckooOperationalError
@@ -14,22 +17,58 @@ from lib.cuckoo.common.exceptions import CuckooReportError
 from lib.cuckoo.common.exceptions import CuckooDependencyError
 from lib.cuckoo.common.objects import Dictionary
 from lib.cuckoo.common.utils import create_folder
-from lib.cuckoo.common.config import Config
-from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.core.database import Database
+from lib.cuckoo.core.resultserver import ResultServer
+
+try:
+    import libvirt
+    HAVE_LIBVIRT = True
+except ImportError:
+    HAVE_LIBVIRT = False
 
 log = logging.getLogger(__name__)
 
-class MachineManager(object):
-    """Base abstract class for analysis machine manager."""
+class Auxiliary(object):
+    """Base abstract class for auxiliary modules."""
+
+    def __init__(self):
+        self.task = None
+        self.machine = None
+        self.options = None
+
+    def set_task(self, task):
+        self.task = task
+
+    def set_machine(self, machine):
+        self.machine = machine
+
+    def set_options(self, options):
+        self.options = options
+
+    def start(self):
+        raise NotImplementedError
+
+    def stop(self):
+        raise NotImplementedError
+
+
+class Machinery(object):
+    """Base abstract class for machinery modules."""
+
+    # Default label used in machinery configuration file to supply virtual
+    # machine name/label/vmx path. Override it if you dubbed it in another
+    # way.
+    LABEL = "label"
 
     def __init__(self):
         self.module_name = ""
         self.options = None
-        self.options_globals = Config(os.path.join(CUCKOO_ROOT, "conf", "cuckoo.conf"))
+        self.options_globals = Config()
         # Database pointer.
         self.db = Database()
-        # Machine table is cleaned to be filled from configuration file at each start.
+
+        # Machine table is cleaned to be filled from configuration file
+        # at each start.
         self.db.clean_machines()
 
     def set_options(self, options):
@@ -39,7 +78,7 @@ class MachineManager(object):
         self.options = options
 
     def initialize(self, module_name):
-        """Read and load machines configuration, try to check the configuration.
+        """Read, load, and verify machines configuration.
         @param module_name: module name.
         """
         # Load.
@@ -60,37 +99,86 @@ class MachineManager(object):
                 machine_opts = self.options.get(machine_id.strip())
                 machine = Dictionary()
                 machine.id = machine_id.strip()
-                machine.label = machine_opts["label"].strip()
-                machine.platform = machine_opts["platform"].strip()
-                machine.ip = machine_opts["ip"].strip()
+                machine.label = machine_opts[self.LABEL]
+                machine.platform = machine_opts["platform"]
+                machine.tags = machine_opts.get("tags")
+                machine.ip = machine_opts["ip"]
+
+                # If configured, use specific network interface for this
+                # machine, else use the default value.
+                machine.interface = machine_opts.get("interface")
+
+                # If configured, use specific snapshot name, else leave it
+                # empty and use default behaviour.
+                machine.snapshot = machine_opts.get("snapshot")
+
+                # If configured, use specific resultserver IP and port,
+                # else use the default value.
+                opt_resultserver = self.options_globals.resultserver
+
+                # the resultserver port might have been dynamically changed
+                #  -> get the current one from the resultserver singelton
+                opt_resultserver.port = ResultServer().port
+
+                ip = machine_opts.get("resultserver_ip", opt_resultserver.ip)
+                port = machine_opts.get("resultserver_port", opt_resultserver.port)
+
+                machine.resultserver_ip = ip
+                machine.resultserver_port = port
+
+                # Strip parameters.
+                for key, value in machine.items():
+                    if value and isinstance(value, basestring):
+                        machine[key] = value.strip()
 
                 self.db.add_machine(name=machine.id,
                                     label=machine.label,
                                     ip=machine.ip,
-                                    platform=machine.platform)
-            except (AttributeError, CuckooOperationalError):
-                log.warning("Configuration details about machine %s are missing. Continue", machine_id)
+                                    platform=machine.platform,
+                                    tags=machine.tags,
+                                    interface=machine.interface,
+                                    snapshot=machine.snapshot,
+                                    resultserver_ip=ip,
+                                    resultserver_port=port)
+            except (AttributeError, CuckooOperationalError) as e:
+                log.warning("Configuration details about machine %s "
+                            "are missing: %s", machine_id.strip(), e)
                 continue
 
     def _initialize_check(self):
-        """Runs checks against virtualization software when a machine manager 
+        """Runs checks against virtualization software when a machine manager
         is initialized.
-        @note: in machine manager modules you may override or superclass 
+        @note: in machine manager modules you may override or superclass
                his method.
         @raise CuckooMachineError: if a misconfiguration or a unkown vm state
                                    is found.
         """
         try:
-            configured_vm = self._list()
+            configured_vms = self._list()
         except NotImplementedError:
             return
 
         for machine in self.machines():
-            if machine.label not in configured_vm:
-                raise CuckooCriticalError("Configured machine {0} was not detected or it's not in proper state".format(machine.label))
+            # If this machine is already in the "correct" state, then we
+            # go on to the next machine.
+            if machine.label in configured_vms and \
+                    self._status(machine.label) in [self.POWEROFF, self.ABORTED]:
+                continue
+
+            # This machine is currently not in its correct state, we're going
+            # to try to shut it down. If that works, then the machine is fine.
+            try:
+                self.stop(machine.label)
+            except CuckooMachineError as e:
+                msg = "Please update your configuration. Unable to shut " \
+                      "'{0}' down or find the machine in its proper state:" \
+                      " {1}".format(machine.label, e)
+                raise CuckooCriticalError(msg)
 
         if not self.options_globals.timeouts.vm_state:
-            raise CuckooCriticalError("Virtual machine state change timeout setting not found, please add it to the config file")
+            raise CuckooCriticalError("Virtual machine state change timeout "
+                                      "setting not found, please add it to "
+                                      "the config file.")
 
     def machines(self):
         """List virtual machines.
@@ -104,18 +192,19 @@ class MachineManager(object):
         """
         return self.db.count_machines_available()
 
-    def acquire(self, machine_id=None, platform=None):
+    def acquire(self, machine_id=None, platform=None, tags=None):
         """Acquire a machine to start analysis.
         @param machine_id: machine ID.
         @param platform: machine platform.
+        @param tags: machine tags
         @return: machine or None.
         """
         if machine_id:
-            return self.db.lock_machine(name=machine_id)
+            return self.db.lock_machine(label=machine_id)
         elif platform:
-            return self.db.lock_machine(platform=platform)
+            return self.db.lock_machine(platform=platform, tags=tags)
         else:
-            return self.db.lock_machine()
+            return self.db.lock_machine(tags=tags)
 
     def release(self, label=None):
         """Release a machine.
@@ -134,7 +223,8 @@ class MachineManager(object):
         @raise CuckooMachineError: if unable to stop machine.
         """
         if len(self.running()) > 0:
-            log.info("Still %s guests alive. Shutting down...", len(self.running()))
+            log.info("Still %s guests alive. Shutting down...",
+                     len(self.running()))
             for machine in self.running():
                 try:
                     self.stop(machine.label)
@@ -169,7 +259,7 @@ class MachineManager(object):
         """
         raise NotImplementedError
 
-    def dump_memory(self, path):
+    def dump_memory(self, label, path):
         """Takes a memory dump of a machine.
         @param path: path to where to store the memory dump.
         """
@@ -178,7 +268,7 @@ class MachineManager(object):
     def _wait_status(self, label, state):
         """Waits for a vm status.
         @param label: virtual machine name.
-        @param state: virtual machine status, accepts more than one states in a list.
+        @param state: virtual machine status, accepts multiple states as list.
         @raise CuckooMachineError: if default waiting timeout expire.
         """
         # This block was originally suggested by Loic Jaquemet.
@@ -191,40 +281,42 @@ class MachineManager(object):
         if isinstance(state, str):
             state = [state]
         while current not in state:
-            log.debug("Waiting %i cuckooseconds for machine %s to switch to status %s", waitme, label, state)
+            log.debug("Waiting %i cuckooseconds for machine %s to switch "
+                      "to status %s", waitme, label, state)
             if waitme > int(self.options_globals.timeouts.vm_state):
-                raise CuckooMachineError("Timeout hit while for machine {0} to change status".format(label))
+                raise CuckooMachineError("Timeout hit while for machine {0} "
+                                         "to change status".format(label))
             time.sleep(1)
             waitme += 1
             current = self._status(label)
 
-class LibVirtMachineManager(MachineManager):
+class LibVirtMachinery(Machinery):
     """Libvirt based machine manager.
 
-    If you want to write a custom module for a virtualization software supported
-    by libvirt you have just to inherit this machine manager and change the 
-    connection string.
+    If you want to write a custom module for a virtualization software
+    supported by libvirt you have just to inherit this machine manager and
+    change the connection string.
     """
-    
+
     # VM states.
     RUNNING = "running"
+    PAUSED = "paused"
     POWEROFF = "poweroff"
     ERROR = "machete"
+    ABORTED = "abort"
 
     def __init__(self):
-        try:
-            global libvirt
-            import libvirt
-        except ImportError:
+        if not HAVE_LIBVIRT:
             raise CuckooDependencyError("Unable to import libvirt")
-        super(LibVirtMachineManager, self).__init__()
+
+        super(LibVirtMachinery, self).__init__()
 
     def initialize(self, module):
-        """Initialize machine manager module. Ovverride defualt to set proper
+        """Initialize machine manager module. Override default to set proper
         connection string.
         @param module:  machine manager module
         """
-        super(LibVirtMachineManager, self).initialize(module)
+        super(LibVirtMachinery, self).initialize(module)
 
     def _initialize_check(self):
         """Runs all checks when a machine manager is initialized.
@@ -232,43 +324,65 @@ class LibVirtMachineManager(MachineManager):
         """
         # Version checks.
         if not self._version_check():
-            raise CuckooMachineError("Libvirt version is not supported, please get an updated version")
+            raise CuckooMachineError("Libvirt version is not supported, "
+                                     "please get an updated version")
+
         # Preload VMs
         self.vms = self._fetch_machines()
-        # Base checks.
-        super(LibVirtMachineManager, self)._initialize_check()
+
+        # Base checks. Also attempts to shutdown any machines which are
+        # currently still active.
+        super(LibVirtMachinery, self)._initialize_check()
 
     def start(self, label):
         """Starts a virtual machine.
         @param label: virtual machine name.
         @raise CuckooMachineError: if unable to start virtual machine.
         """
-        log.debug("Staring machine %s", label)
-        
-        if self._status(label) == self.RUNNING:
-            raise CuckooMachineError("Trying to start an already started machine {0}".format(label))
+        log.debug("Starting machine %s", label)
 
-        # Get current snapshot.
+        if self._status(label) != self.POWEROFF:
+            msg = "Trying to start a virtual machine that has not " \
+                  "been turned off {0}".format(label)
+            raise CuckooMachineError(msg)
+
         conn = self._connect()
 
-        try:
-            snap = self.vms[label].hasCurrentSnapshot(flags=0)
-        except libvirt.libvirtError:
-            self._disconnect(conn)
-            raise CuckooMachineError("Unable to get current snapshot for virtual machine {0}".format(label))
+        vm_info = self.db.view_machine_by_label(label)
 
-        # Revert to latest snapshot.
-        if snap:
+        snapshot_list = self.vms[label].snapshotListNames(flags=0)
+
+        # If a snapshot is configured try to use it.
+        if vm_info.snapshot and vm_info.snapshot in snapshot_list:
+            # Revert to desired snapshot, if it exists.
+            log.debug("Using snapshot {0} for virtual machine "
+                      "{1}".format(vm_info.snapshot, label))
             try:
-                current = self.vms[label].snapshotCurrent(flags=0)
-                self.vms[label].revertToSnapshot(current, flags=0)
+                vm = self.vms[label]
+                snapshot = vm.snapshotLookupByName(vm_info.snapshot, flags=0)
+                self.vms[label].revertToSnapshot(snapshot, flags=0)
             except libvirt.libvirtError:
-                raise CuckooMachineError("Unable to restore snapshot on virtual machine {0}".format(label))
+                msg = "Unable to restore snapshot {0} on " \
+                      "virtual machine {1}".format(vm_info.snapshot, label)
+                raise CuckooMachineError(msg)
+            finally:
+                self._disconnect(conn)
+        elif self._get_snapshot(label):
+            snapshot = self._get_snapshot(label)
+            log.debug("Using snapshot {0} for virtual machine "
+                      "{1}".format(snapshot.getName(), label))
+            try:
+                self.vms[label].revertToSnapshot(snapshot, flags=0)
+            except libvirt.libvirtError:
+                raise CuckooMachineError("Unable to restore snapshot on "
+                                         "virtual machine {0}".format(label))
             finally:
                 self._disconnect(conn)
         else:
             self._disconnect(conn)
-            raise CuckooMachineError("No snapshot found for virtual machine {0}".format(label))
+            raise CuckooMachineError("No snapshot found for virtual machine "
+                                     "{0}".format(label))
+
         # Check state.
         self._wait_status(label, self.RUNNING)
 
@@ -280,25 +394,29 @@ class LibVirtMachineManager(MachineManager):
         log.debug("Stopping machine %s", label)
 
         if self._status(label) == self.POWEROFF:
-            raise CuckooMachineError("Trying to stop an already stopped machine {0}".format(label))
+            raise CuckooMachineError("Trying to stop an already stopped "
+                                     "machine {0}".format(label))
 
         # Force virtual machine shutdown.
         conn = self._connect()
         try:
             if not self.vms[label].isActive():
-                log.debug("Trying to stop an already stopped machine %s. Skip", label)
+                log.debug("Trying to stop an already stopped machine %s. "
+                          "Skip", label)
             else:
-                self.vms[label].destroy() # Machete's way!
+                self.vms[label].destroy()  # Machete's way!
         except libvirt.libvirtError as e:
-            raise CuckooMachineError("Error stopping virtual machine {0}: {1}".format(label, e))
+            raise CuckooMachineError("Error stopping virtual machine "
+                                     "{0}: {1}".format(label, e))
         finally:
             self._disconnect(conn)
         # Check state.
         self._wait_status(label, self.POWEROFF)
 
     def shutdown(self):
-        """Override shutdown to free libvirt handlers, anyway they print errors."""
-        super(LibVirtMachineManager, self).shutdown()
+        """Override shutdown to free libvirt handlers - they print errors."""
+        super(LibVirtMachinery, self).shutdown()
+
         # Free handlers.
         self.vms = None
 
@@ -312,7 +430,8 @@ class LibVirtMachineManager(MachineManager):
         try:
             self.vms[label].coreDump(path, flags=libvirt.VIR_DUMP_MEMORY_ONLY)
         except libvirt.libvirtError as e:
-            raise CuckooMachineError("Error dumping memory virtual machine {0}: {1}".format(label, e))
+            raise CuckooMachineError("Error dumping memory virtual machine "
+                                     "{0}: {1}".format(label, e))
         finally:
             self._disconnect(conn)
 
@@ -322,7 +441,7 @@ class LibVirtMachineManager(MachineManager):
         @return: status string.
         """
         log.debug("Getting status for %s", label)
-        
+
         # Stetes mapping of python-libvirt.
         # virDomainState
         # VIR_DOMAIN_NOSTATE = 0
@@ -338,13 +457,16 @@ class LibVirtMachineManager(MachineManager):
         try:
             state = self.vms[label].state(flags=0)
         except libvirt.libvirtError as e:
-            raise CuckooMachineError("Error getting status for virtual machine {0}: {1}".format(label, e))
+            raise CuckooMachineError("Error getting status for virtual "
+                                     "machine {0}: {1}".format(label, e))
         finally:
             self._disconnect(conn)
 
         if state:
-            if state[0] == 1 or state[0] == 3:
+            if state[0] == 1:
                 status = self.RUNNING
+            elif state[0] == 3:
+                status = self.PAUSED
             elif state[0] == 4 or state[0] == 5:
                 status = self.POWEROFF
             else:
@@ -355,15 +477,17 @@ class LibVirtMachineManager(MachineManager):
             self.set_status(label, status)
             return status
         else:
-            raise CuckooMachineError("Unable to get status for {0}".format(label))
+            raise CuckooMachineError("Unable to get status for "
+                                     "{0}".format(label))
 
     def _connect(self):
         """Connects to libvirt subsystem.
-        @raise CuckooMachineError: if cannot connect to libvirt or missing connection string.
+        @raise CuckooMachineError: when unable to connect to libvirt.
         """
         # Check if a connection string is available.
         if not self.dsn:
-            raise CuckooMachineError("You must provide a proper connection string")
+            raise CuckooMachineError("You must provide a proper "
+                                     "connection string")
 
         try:
             return libvirt.open(self.dsn)
@@ -398,7 +522,8 @@ class LibVirtMachineManager(MachineManager):
         try:
             vm = conn.lookupByName(label)
         except libvirt.libvirtError:
-                raise CuckooMachineError("Cannot found machine {0}".format(label))
+                raise CuckooMachineError("Cannot find machine "
+                                         "{0}".format(label))
         finally:
             self._disconnect(conn)
         return vm
@@ -425,6 +550,45 @@ class LibVirtMachineManager(MachineManager):
         else:
             return False
 
+    def _get_snapshot(self, label):
+        """Get current snapshot for virtual machine
+        @param label: virtual machine name
+        @return None or current snapshot
+        @raise CuckooMachineError: if cannot find current snapshot or
+                                   when there are too many snapshots available
+        """
+        def _extract_creation_time(node):
+            """Extracts creation time from a KVM vm config file.
+            @param node: config file node
+            @return: extracted creation time
+            """
+            xml = ET.fromstring(node.getXMLDesc(flags=0))
+            return xml.findtext("./creationTime")
+
+        snapshot = None
+        conn = self._connect()
+        try:
+            vm = self.vms[label]
+
+            # Try to get the currrent snapshot, otherwise fallback on the latest
+            # from config file.
+            if vm.hasCurrentSnapshot(flags=0):
+                snapshot = vm.snapshotCurrent(flags=0)
+            else:
+                log.debug("No current snapshot, using latest snapshot")
+
+                # No current snapshot, try to get the last one from config file.
+                snapshot = sorted(vm.listAllSnapshots(flags=0),
+                                  key=_extract_creation_time,
+                                  reverse=True)[0]
+        except libvirt.libvirtError:
+            raise CuckooMachineError("Unable to get snapshot for "
+                                     "virtual machine {0}".format(label))
+        finally:
+            self._disconnect(conn)
+
+        return snapshot
+
 class Processing(object):
     """Base abstract class for processing module."""
     order = 1
@@ -435,6 +599,7 @@ class Processing(object):
         self.logs_path = ""
         self.task = None
         self.options = None
+        self.results = {}
 
     def set_options(self, options):
         """Set report options.
@@ -462,6 +627,13 @@ class Processing(object):
         self.pcap_path = os.path.join(self.analysis_path, "dump.pcap")
         self.pmemory_path = os.path.join(self.analysis_path, "memory")
         self.memory_path = os.path.join(self.analysis_path, "memory.dmp")
+        self.mitmout_path = os.path.join(self.analysis_path, "mitm.log")
+        self.mitmerr_path = os.path.join(self.analysis_path, "mitm.err")
+        self.tlsmaster_path = os.path.join(self.analysis_path, "tlsmaster.txt")
+
+    def set_results(self, results):
+        """Set the results - the fat dictionary."""
+        self.results = results
 
     def run(self):
         """Start processing.
@@ -469,12 +641,59 @@ class Processing(object):
         """
         raise NotImplementedError
 
+class SignatureFlags(object):
+    """A class supporting signatures.
+
+    Keeping flags generated by on_call for later processing in on_complete.
+
+    """
+    def __init__(self):
+        self.data = []
+
+    def set(self, name, pid=None, tid=None, timestamp=None):
+        """
+
+        @param name: name of the flag to set
+        @param pid: pid the flag occured in
+        @param tid: thread id the flag occured in
+        @param timestamp: timestamp the flag occured
+        @return:
+        """
+        data = dict(name=name, pid=pid, tid=tid, timestamp=timestamp)
+        if data not in self.data:
+            self.data.append(data)
+
+    def find(self, name=None, pid=None, tid=None, before=None, after=None):
+        """ Get a list of flags matching the given criteria
+
+        @param name: name of the flag event
+        @param pid: pid where the flag-event happend in
+        @param tid: tid where the flag-event happend in
+        @param before: Before or at a given timestamp
+        @param after: After or at a given timestamp
+        @return:
+        """
+        res = self.data
+        if name is not None:
+            res = [item for item in res if item["name"] == name]
+        if pid is not None:
+            res = [item for item in res if item["pid"] == pid]
+        if tid is not None:
+            res = [item for item in res if item["tid"] == tid]
+        if before is not None:
+            res = [item for item in res if item["timestamp"] <= before]
+        if after is not None:
+            res = [item for item in res if item["timestamp"] >= after]
+        return res
+
+
 class Signature(object):
     """Base class for Cuckoo signatures."""
 
     name = ""
     description = ""
     severity = 1
+    order = 1
     categories = []
     families = []
     authors = []
@@ -484,9 +703,37 @@ class Signature(object):
     minimum = None
     maximum = None
 
-    def __init__(self, results=None):
+    filter_processnames = set()
+    filter_apinames = set()
+    filter_categories = set()
+
+    def __init__(self, caller):
+        """
+        @param caller: calling object. Stores results in caller.results
+        """
         self.data = []
-        self.results = results
+        self._caller = caller
+        self._current_call_cache = None
+        self._current_call_dict = None
+        self.flags = SignatureFlags()
+        self.pid = None
+        self.tid = None
+        self.cid = None
+
+        self._mark_start = None
+        self._mark_end = None
+
+        # Used to de-activate a signature that already matched.
+        self._active = True
+  
+    def is_active(self):
+        return self._active
+
+    def deactivate(self):
+        self._active = False
+
+    def activate(self):
+        self._active = True
 
     def _check_value(self, pattern, subject, regex=False):
         """Checks a pattern against a given subject.
@@ -516,6 +763,115 @@ class Signature(object):
 
         return None
 
+    def mark_start(self):
+        """Set a mark for the start of the signature."""
+        self._mark_start = dict(pid=self.pid, tid=self.tid, cid=self.cid)
+
+    def mark_end(self):
+        """Set a mark for the end of the signature."""
+        self._mark_end = dict(pid=self.pid, tid=self.tid, cid=self.cid)
+
+    def _get_mark(self):
+        """Store mark with the signature.
+
+        mark_start must be set. mark_end is optional
+        """
+        res = dict(start={}, end={})
+
+        if not self._mark_start:
+            return
+
+        res["start"] = self._mark_start
+        res["end"] = self._mark_end
+        return res
+
+    def get_results(self, key=None, default=None):
+        if key:
+            return self._caller.results.get(key, default)
+
+        return self._caller.results
+
+    def list_signatures(self):
+        """List signatures that matched by name."""
+        res = []
+        for sig in self.get_results("signatures", []):
+            res.append(sig["name"])
+        return res
+
+    def get_processes(self, name=None):
+        """Get a list of processes.
+
+        @param name: If set only return processes with that name.
+        @return: List of processes or empty list
+        """
+        for item in self.get_results("behavior", {}).get("processes", []):
+            if name is None or item["process_name"] == name:
+                yield item
+
+    def get_processes_by_pid(self, pid=None):
+        """Get a process by its process identifier.
+
+        @param pid: pid to search for. Can be None to get any process
+        @return: List of processes or empty list
+        """
+        for item in self.get_results("behavior", {}).get("processes", []):
+            if pid is None or item["pid"] == pid:
+                yield item
+
+    def get_threads(self, pid=None):
+        """Get a list of threads for a given process.
+
+        @param pid: pid of the process
+        @return: List of processes or empty list
+        """
+        for proc in self.get_processes_by_pid(pid):
+            for item in proc["threads"]:
+                yield item
+
+    def _get_summary(self, pid, actions):
+        """Get generic info from summary.
+
+        @param pid: pid of the process. None for all
+        @param actions: A list of actions to get
+        """
+        ret = []
+        for process in self.get_results("behavior", {}).get("generic", []):
+            for action in actions:
+                if action not in process["summary"]:
+                    continue
+
+                ret += process["summary"][action]
+
+        return ret
+
+    def get_files(self, pid=None, actions=None):
+        """Get files written by a specific process.
+
+        @param pid: the process or None for all
+        @param actions: actions to search for. None is all
+        @return: yields files
+
+        """
+        if actions is None:
+            actions = "file_written", "file_read", "file_deleted"
+
+        for res in self._get_summary(pid, actions):
+            yield res
+
+    def get_keys(self, pid=None, actions=None):
+        """Get registry keys.
+
+        @param pid: The pid to look in or None for all.
+        @param actions: the actions as a list.
+        @return: yields registry keys
+
+        """
+        if actions is None:
+            actions = "regkey_written", "regkey_opened", "regkey_read"
+
+        for res in self._get_summary(pid, actions):
+            yield res
+
     def check_file(self, pattern, regex=False):
         """Checks for a file being opened.
         @param pattern: string or expression to check for.
@@ -523,20 +879,41 @@ class Signature(object):
                       expression or not and therefore should be compiled.
         @return: boolean with the result of the check.
         """
-        return self._check_value(pattern=pattern,
-                                 subject=self.results["behavior"]["summary"]["files"],
-                                 regex=regex)
+        files = list(self.get_files())
 
-    def check_key(self, pattern, regex=False):
-        """Checks for a registry key being opened.
+        if self._check_value(pattern=pattern, subject=files, regex=regex):
+            return True
+        return False
+
+    def check_key(self, pattern, regex=False, actions=None, pid=None):
+        """Checks for a registry key being accessed.
         @param pattern: string or expression to check for.
         @param regex: boolean representing if the pattern is a regular
                       expression or not and therefore should be compiled.
+        @param actions: a list of key actions to use.
+        @param pid: The process id to check. If it is set to None, all
+                    processes will be checked.
         @return: boolean with the result of the check.
         """
+        if actions is None:
+            actions = "regkey_written", "regkey_opened", "regkey_read"
+
+        regkeys = list(self.get_keys(pid, actions))
+
         return self._check_value(pattern=pattern,
-                                 subject=self.results["behavior"]["summary"]["keys"],
+                                 subject=regkeys,
                                  regex=regex)
+
+    def get_mutexes(self, pid=None):
+        """
+        @param pid: Pid to filter for
+        @return:List of mutexes
+        """
+        mutexes = []
+        for process in self.get_processes_by_pid(pid):
+            if "summary" in process and "mutexes" in process["summary"]:
+                mutexes += process["summary"]["mutex"]
+        return mutexes
 
     def check_mutex(self, pattern, regex=False):
         """Checks for a mutex being opened.
@@ -546,7 +923,7 @@ class Signature(object):
         @return: boolean with the result of the check.
         """
         return self._check_value(pattern=pattern,
-                                 subject=self.results["behavior"]["summary"]["mutexes"],
+                                 subject=self.get_mutexes(),
                                  regex=regex)
 
     def check_api(self, pattern, process=None, regex=False):
@@ -558,7 +935,7 @@ class Signature(object):
         @return: boolean with the result of the check.
         """
         # Loop through processes.
-        for item in self.results["behavior"]["processes"]:
+        for item in self.get_processes(process):
             # Check if there's a process name filter.
             if process:
                 if item["process_name"] != process:
@@ -574,56 +951,81 @@ class Signature(object):
 
         return None
 
-    def check_argument(self,
-                       pattern,
-                       name=None,
-                       api=None,
-                       category=None,
-                       process=None,
-                       regex=False):
+    def check_argument_call(self, call, pattern, name=None, api=None,
+                            category=None, regex=False):
         """Checks for a specific argument of an invoked API.
+        @param call: API call information.
         @param pattern: string or expression to check for.
         @param name: optional filter for the argument name.
         @param api: optional filter for the API function name.
         @param category: optional filter for a category name.
-        @param process: optional filter for a specific process name.
         @param regex: boolean representing if the pattern is a regular
                       expression or not and therefore should be compiled.
         @return: boolean with the result of the check.
         """
-        # Loop through processes.
-        for item in self.results["behavior"]["processes"]:
-            # Check if there's a process name filter.
-            if process:
-                if item["process_name"] != process:
+        # Check if there's an API name filter.
+        if api:
+            if call["api"] != api:
+                return False
+
+        # Check if there's a category filter.
+        if category:
+            if self.get_category(call) != category:
+                return False
+
+        # Loop through arguments.
+        for argument in call["arguments"]:
+            # Check if there's an argument name filter.
+            if name:
+                if argument != name:
                     continue
 
-            # Loop through API calls.
-            for call in item["calls"]:
-                # Check if there's an API name filter.
-                if api:
-                    if call["api"] != api:
-                        continue
+            # Check if the argument value matches.
+            if self._check_value(pattern=pattern,
+                                 subject=call["arguments"][argument],
+                                 regex=regex):
+                return argument["value"]
 
-                # Check if there's a category filter.
-                if category:
-                    if call["category"] != category:
-                        continue
+        return False
 
-                # Loop through arguments.
-                for argument in call["arguments"]:
-                    # Check if there's an argument name filter.
-                    if name:
-                        if argument["name"] != name:
-                            continue
+    def get_category(self, call):
+        """Return the category of the call."""
+        return call.get("category")
 
-                    # Check if the argument value matches.
-                    if self._check_value(pattern=pattern,
-                                         subject=argument["value"],
-                                         regex=regex):
-                        return argument["value"]
+    def get_net_generic(self, subtype):
+        """Generic getting network data.
 
-        return None
+        @param subtype: subtype string to search for.
+        """
+        return self.get_results("network", {}).get(subtype, [])
+
+    def get_net_hosts(self):
+        """Returns a list of all hosts."""
+        return self.get_net_generic("hosts")
+
+    def get_net_domains(self):
+        """Returns a list of all domains."""
+        return self.get_net_generic("domains")
+
+    def get_net_http(self):
+        """Returns a list of all http data."""
+        return self.get_net_generic("http")
+
+    def get_net_udp(self):
+        """Returns a list of all udp data."""
+        return self.get_net_generic("udp")
+
+    def get_net_icmp(self):
+        """Returns a list of all icmp data."""
+        return self.get_net_generic("icmp")
+
+    def get_net_irc(self):
+        """Returns a list of all irc data."""
+        return self.get_net_generic("irc")
+
+    def get_net_smtp(self):
+        """Returns a list of all smtp data."""
+        return self.get_net_generic("smtp")
 
     def check_ip(self, pattern, regex=False):
         """Checks for an IP address being contacted.
@@ -633,7 +1035,7 @@ class Signature(object):
         @return: boolean with the result of the check.
         """
         return self._check_value(pattern=pattern,
-                                 subject=self.results["network"]["hosts"],
+                                 subject=self.get_net_hosts(),
                                  regex=regex)
 
     def check_domain(self, pattern, regex=False):
@@ -643,7 +1045,7 @@ class Signature(object):
                       expression or not and therefore should be compiled.
         @return: boolean with the result of the check.
         """
-        for item in self.results["network"]["domains"]:
+        for item in self.get_net_domains():
             if self._check_value(pattern=pattern,
                                  subject=item["domain"],
                                  regex=regex):
@@ -658,7 +1060,7 @@ class Signature(object):
                       expression or not and therefore should be compiled.
         @return: boolean with the result of the check.
         """
-        for item in self.results["network"]["http"]:
+        for item in self.get_net_http():
             if self._check_value(pattern=pattern,
                                  subject=item["uri"],
                                  regex=regex):
@@ -666,12 +1068,115 @@ class Signature(object):
 
         return None
 
-    def run(self):
-        """Start signature processing.
-        @param results: analysis results.
-        @raise NotImplementedError: this method is abstract.
+    def get_argument(self, call, name):
+        """Retrieves the value of a specific argument from an API call.
+
+        @param call: API call object.
+        @param name: name of the argument to retrieve.
+        @return: value of the argument or None
         """
-        raise NotImplementedError
+        return call.get("arguments", {}).get(name)
+
+    def quickout(self):
+        """Quickout test. Implement that to do a fast verification if
+        signature should be run.
+
+        Can be used for performance optimisation. Check the file type for
+        example to avoid running PDF signatures on PE files.
+
+        @return: True if you want to remove the signature from the list,
+                 False if you still want to process it.
+        """
+        pass
+
+    def add_match(self, process, type_, match):
+        """Adds a match to the signature data.
+        @param process: The process triggering the match.
+        @param type: The type of matching data (e.g., "api", "mutex", etc).
+        @param match: Value or array of values triggering the match.
+        """
+        signs = []
+        if isinstance(match, (tuple, list)):
+            for item in match:
+                signs.append({"type": type_, "value": item})
+        else:
+            signs.append({"type": type_, "value": match})
+
+        process_summary = None
+        if process:
+            process_summary = {
+                "process_name": process["process_name"],
+                "pid": process["pid"],
+            }
+
+        self.data.append({"process": process_summary, "signs": signs})
+
+    def has_matches(self):
+        """Returns true if there is matches.
+        @return: boolean indicating if there is any match registered
+        """
+        return len(self.data) > 0
+
+    def on_call(self, call, process):
+        """Notify signature about API call. Return value determines
+        if this signature is done or could still match.
+
+        Only called if signature is "active".
+
+        @param call: logged API call.
+        @param process: proc object.
+        """
+        pass
+
+    def on_signature(self, matched_sig):
+        """Called if another signature matched.
+
+        @param matched_sig: The siganture that just matched
+        """
+        pass
+
+    def on_process(self, pid):
+        """Called on process change.
+
+        Can be used for cleanup of flags, re-activation of the signature, etc.
+
+        @param pid: ID of the new process
+        """
+        pass
+
+    def on_thread(self, pid, tid):
+        """Called on thread change.
+
+        Can be used for cleanup of flags, re-activation of the signature, etc.
+
+        @param pid: id of the new process
+        @param tid: id of the new thread
+        """
+        pass
+
+    def on_complete(self):
+        """Evented signature is notified when all API calls are done."""
+        pass
+
+    def run(self):
+        """Main function for old-style non-evented signatures.
+        """
+        pass
+
+    def as_result(self):
+        """Properties as a dict (for results).
+        @return: result dictionary.
+        """
+        return dict(
+            name=self.name,
+            description=self.description,
+            severity=self.severity,
+            references=self.references,
+            data=self.data,
+            marker=self._get_mark(),
+            alert=self.alert,
+            families=self.families
+        )
 
 class Report(object):
     """Base abstract class for reporting module."""
@@ -683,17 +1188,19 @@ class Report(object):
         self.task = None
         self.options = None
 
+    def _get_analysis_path(self, subpath):
+        return os.path.join(self.analysis_path, subpath)
+
     def set_path(self, analysis_path):
         """Set analysis folder path.
         @param analysis_path: analysis folder path.
         """
         self.analysis_path = analysis_path
-        self.conf_path = os.path.join(self.analysis_path, "analysis.conf")
-        self.file_path = os.path.realpath(os.path.join(self.analysis_path,
-                                                       "binary"))
-        self.reports_path = os.path.join(self.analysis_path, "reports")
-        self.shots_path = os.path.join(self.analysis_path, "shots")
-        self.pcap_path = os.path.join(self.analysis_path, "dump.pcap")
+        self.conf_path = self._get_analysis_path("analysis.conf")
+        self.file_path = os.path.realpath(self._get_analysis_path("binary"))
+        self.reports_path = self._get_analysis_path("reports")
+        self.shots_path = self._get_analysis_path("shots")
+        self.pcap_path = self._get_analysis_path("dump.pcap")
 
         try:
             create_folder(folder=self.reports_path)
@@ -716,4 +1223,33 @@ class Report(object):
         """Start report processing.
         @raise NotImplementedError: this method is abstract.
         """
+        raise NotImplementedError
+
+class BehaviorHandler(object):
+    """Base class for behavior handlers inside of BehaviorAnalysis."""
+    key = "undefined"
+
+    # Behavior event types this handler is interested in.
+    event_types = []
+
+    def __init__(self, behavior_analysis):
+        self.analysis = behavior_analysis
+
+    def handles_path(self, logpath):
+        """Needs to return True for the log files this handler wants to
+        process."""
+        return False
+
+    def parse(self, logpath):
+        """Called after handles_path succeeded, should generate behavior
+        events."""
+        raise NotImplementedError
+
+    def handle_event(self, event):
+        """Handle an event that gets passed down the stack."""
+        raise NotImplementedError
+
+    def run(self):
+        """Return the handler specific structure, gets placed into
+        behavior[self.key]."""
         raise NotImplementedError

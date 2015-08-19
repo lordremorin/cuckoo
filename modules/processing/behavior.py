@@ -1,414 +1,337 @@
-# Copyright (C) 2010-2013 Cuckoo Sandbox Developers.
+# Copyright (C) 2010-2015 Cuckoo Foundation.
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-import os
-import sys
-import csv
+import collections
 import logging
-import datetime
-import inspect
+import os
 
-from lib.cuckoo.common.abstracts import Processing
-from lib.cuckoo.common.utils import convert_to_printable, logtime
-from lib.cuckoo.common.netlog import NetlogParser
+from lib.cuckoo.common.abstracts import Processing, BehaviorHandler
+from lib.cuckoo.common.config import Config
+
+from .platform.windows import WindowsMonitor
+from .platform.linux import LinuxSystemTap
 
 log = logging.getLogger(__name__)
 
-class ParseProcessLog(list):
-    """Parses process log file."""
-    
-    def __init__(self, log_path):
-        """@param log_path: log file path."""
-        self._log_path = log_path
-        self.fd = None
-        self.parser = None
+class Summary(BehaviorHandler):
+    """Generates overview summary information (not split by process)."""
 
-        self.process_id = None
-        self.process_name = None
-        self.parent_id = None
-        self.first_seen = None
-        self.calls = self
-        self.lastcall = None
+    key = "summary"
+    event_types = ["generic"]
 
-        if os.path.exists(log_path) and os.stat(log_path).st_size > 0:
-            self.parse_first_and_reset()
+    def __init__(self, *args, **kwargs):
+        super(Summary, self).__init__(*args, **kwargs)
+        self.results = collections.defaultdict(set)
 
-    def parse_first_and_reset(self):
-        self.fd = open(self._log_path, "rb")
-        self.parser = NetlogParser(self)
-        self.parser.read_next_message()
-        self.fd.seek(0)
-
-    def read(self, length):
-        if length == 0: return b''
-        buf = self.fd.read(length)
-        if not buf or len(buf) != length: raise EOFError()
-        return buf
-
-    def __iter__(self):
-        #log.debug('iter called by this guy: {0}'.format(inspect.stack()[1]))
-        return self
-
-    def __getitem__(self, key):
-        return getattr(self, key)
-
-    def __repr__(self):
-        return "ParseProcessLog {0}".format(self._log_path)
-
-    def __nonzero__(self):
-        return True
-
-    def compare_calls(self, a, b):
-        """Compare two calls for equality. Same implementation as before netlog.
-        @param a: call a
-        @param b: call b
-        @return: True if a == b else False
-        """
-        if a["api"] == b["api"] and \
-           a["status"] == b["status"] and \
-           a["arguments"] == b["arguments"] and \
-           a["return"] == b["return"]:
-            return True
-        return False
-
-    def wait_for_lastcall(self):
-        while not self.lastcall:
-            r = None
-            try: r = self.parser.read_next_message()
-            except EOFError:
-                return False
-
-            if not r:
-                return False
-        return True
-
-    def next(self):
-        x = self.wait_for_lastcall()
-        if not x:
-            self.fd.seek(0)
-            raise StopIteration()
-
-        nextcall, self.lastcall = self.lastcall, None
-
-        x = self.wait_for_lastcall()
-        while self.lastcall and self.compare_calls(nextcall, self.lastcall):
-            nextcall["repeated"] += 1
-            self.lastcall = None
-            x = self.wait_for_lastcall()
-
-        return nextcall
-
-    def log_process(self, context, timestring, pid, ppid, modulepath, procname):
-        self.process_id, self.parent_id, self.process_name = pid, ppid, procname
-        self.first_seen = timestring
-
-    def log_thread(self, context, pid):
-        pass
-
-    def log_call(self, context, apiname, modulename, arguments):
-        apiindex, status, returnval, tid, timediff = context
-
-        current_time = self.first_seen + datetime.timedelta(0,0, timediff*1000)
-        timestring = logtime(current_time)
-
-        self.lastcall = self._parse([timestring,
-                                     tid,
-                                     modulename,
-                                     apiname, 
-                                     status,
-                                     returnval] + arguments)
-
-    def _parse(self, row):
-        """Parse log row.
-        @param row: row data.
-        @return: parsed information dict.
-        """
-        call = {}
-        arguments = []
-
-        try:
-            timestamp = row[0]    # Timestamp of current API call invocation.
-            thread_id = row[1]    # Thread ID.
-            category = row[2]     # Win32 function category.
-            api_name = row[3]     # Name of the Windows API.
-            status_value = row[4] # Success or Failure?
-            return_value = row[5] # Value returned by the function.
-        except IndexError as e:
-            log.debug("Unable to parse process log row: %s", e)
-            return None
-
-        # Now walk through the remaining columns, which will contain API
-        # arguments.
-        for index in range(6, len(row)):
-            argument = {}
-
-            # Split the argument name with its value based on the separator.
-            try:                
-                (arg_name, arg_value) = row[index]
-            except ValueError as e:
-                log.debug("Unable to parse analysis row argument (row=%s): %s", row[index], e)
-                continue
-
-            argument["name"] = arg_name
-            argument["value"] = convert_to_printable(str(arg_value)).lstrip("\\??\\")
-            arguments.append(argument)
-
-        call["timestamp"] = timestamp
-        call["thread_id"] = str(thread_id)
-        call["category"] = category
-        call["api"] = api_name
-        call["status"] = bool(int(status_value))
-
-        if isinstance(return_value, int):
-            call["return"] = "0x%.08x" % return_value
-        else:
-            call["return"] = convert_to_printable(str(return_value))
-
-        call["arguments"] = arguments
-        call["repeated"] = 0
-
-        return call
-
-class Processes:
-    """Processes analyzer."""
-
-    def __init__(self, logs_path):
-        """@param  logs_path: logs path."""
-        self._logs_path = logs_path
+    def handle_event(self, event):
+        self.results[event["category"]].add(event["value"])
 
     def run(self):
-        """Run analysis.
-        @return: processes infomartion list.
+        for key, value in self.results.items():
+            self.results[key] = list(value)
+        return self.results
+
+class Anomaly(BehaviorHandler):
+    """Anomaly detected during analysis.
+    For example: a malware tried to remove Cuckoo's hooks.
+    """
+
+    key = "anomaly"
+    event_types = ["anomaly"]
+
+    def __init__(self, *args, **kwargs):
+        super(Anomaly, self).__init__(*args, **kwargs)
+        self.anomalies = []
+
+    def handle_event(self, call):
+        """Process API calls.
+        @param call: API call object
+        @param process: process object
         """
-        results = []
+        category, funcname, message = None, None, None
+        for row in call["arguments"]:
+            if row["name"] == "Subcategory":
+                category = row["value"]
+            if row["name"] == "FunctionName":
+                funcname = row["value"]
+            if row["name"] == "Message":
+                message = row["value"]
 
-        if not os.path.exists(self._logs_path):
-            log.error("Analysis results folder does not exist at path \"%s\".",
-                      self._logs_path)
-            return results
+        self.anomalies.append(dict(
+            # name=process["process_name"],
+            # pid=process["process_id"],
+            category=category,
+            funcname=funcname,
+            message=message,
+        ))
 
-        if len(os.listdir(self._logs_path)) == 0:
-            log.error("Analysis results folder does not contain any file.")
-            return results
+    def run(self):
+        """Fetch all anomalies."""
+        return self.anomalies
 
-        for file_name in os.listdir(self._logs_path):
-            file_path = os.path.join(self._logs_path, file_name)
+class ProcessTree(BehaviorHandler):
+    """Generates process tree."""
 
-            if os.path.isdir(file_path):
-                continue
-            
-            if not file_path.endswith(".raw"):
-                continue
+    key = "processtree"
+    event_types = ["process"]
 
-            # Invoke parsing of current log file.
-            current_log = ParseProcessLog(file_path)
-            if current_log.process_id == None: continue
+    def __init__(self, *args, **kwargs):
+        super(ProcessTree, self).__init__(*args, **kwargs)
+        self.processes = {}
 
-            # If the current log actually contains any data, add its data to
-            # the global results list.
-            results.append({
-                "process_id": current_log.process_id,
-                "process_name": current_log.process_name,
-                "parent_id": current_log.parent_id,
-                "first_seen": logtime(current_log.first_seen),
-                "calls": current_log
-            })
+    def handle_event(self, process):
+        if process["pid"] in self.processes:
+            log.warning("Found the same process identifier twice, this "
+                        "shouldn't happen!")
+            return
 
-        # Sort the items in the results list chronologically. In this way we
-        # can have a sequential order of spawned processes.
-        results.sort(key=lambda process: process["first_seen"])
+        self.processes[process["pid"]] = {
+            "pid": process["pid"],
+            "ppid": process["ppid"],
+            "process_name": process["process_name"],
+            "first_seen": process["first_seen"],
+            "children": [],
+        }
 
-        return results
+    def run(self):
+        root = {"children": []}
 
-class Summary:
+        for p in self.processes.values():
+            self.processes.get(p["ppid"], root)["children"].append(p)
+
+        return root["children"]
+
+class GenericBehavior(BehaviorHandler):
     """Generates summary information."""
-    
-    def __init__(self, proc_results):
-        """@param oroc_results: enumerated processes results."""
-        self.proc_results = proc_results
+
+    key = "generic"
+    event_types = ["process", "generic"]
+
+    def __init__(self, *args, **kwargs):
+        super(GenericBehavior, self).__init__(*args, **kwargs)
+        self.processes = {}
+
+    def handle_process_event(self, process):
+        if process["pid"] in self.processes:
+            return
+
+        self.processes[process["pid"]] = {
+            "pid": process["pid"],
+            "pid": process["ppid"],
+            "process_name": process["process_name"],
+            "first_seen": process["first_seen"],
+            "summary": collections.defaultdict(set),
+        }
+
+    def handle_generic_event(self, event):
+        if event["pid"] in self.processes:
+            # TODO: rewrite / generalize / more flexible
+            pid, category = event["pid"], event["category"]
+            self.processes[pid]["summary"][category].add(event["value"])
+        else:
+            log.warning("Generic event for unknown process id %u", event["pid"])
 
     def run(self):
-        """Get registry keys, mutexes and files.
-        @return: Summary of keys, mutexes and files.
-        """
-        keys = []
-        mutexes = []
-        files = []
+        for process in self.processes.values():
+            for key, value in process["summary"].items():
+                process["summary"][key] = list(value)
 
-        def _check_registry(handles, registry, subkey, handle):
-            for known_handle in handles:
-                if handle != 0 and handle == known_handle["handle"]:
-                    return None
+        return self.processes.values()
 
-            name = ""
-            if registry == 0x80000000:
-                name = "HKEY_CLASSES_ROOT\\"
-            elif registry == 0x80000001:
-                name = "HKEY_CURRENT_USER\\"
-            elif registry == 0x80000002:
-                name = "HKEY_LOCAL_MACHINE\\"
-            elif registry == 0x80000003:
-                name = "HKEY_USERS\\"
-            elif registry == 0x80000004:
-                name = "HKEY_PERFORMANCE_DATA\\"
-            elif registry == 0x80000005:
-                name = "HKEY_CURRENT_CONFIG\\"
-            elif registry == 0x80000006:
-                name = "HKEY_DYN_DATA\\"
-            else:
-                for known_handle in handles:
-                    if registry == known_handle["handle"]:
-                        name = known_handle["name"] + "\\"
+class ApiStats(BehaviorHandler):
+    """Counts API calls."""
+    key = "apistats"
+    event_types = ["apicall"]
 
-            handles.append({"handle" : handle, "name" : name + subkey})
-            return name + subkey
+    def __init__(self, *args, **kwargs):
+        super(ApiStats, self).__init__(*args, **kwargs)
+        self.processes = collections.defaultdict(lambda: collections.defaultdict(lambda: 0))
 
-        def _remove_handle(handles, handle):
-            for known_handle in handles:
-                if handle != 0 and handle == known_handle["handle"]:
-                    handles.remove(known_handle)
-
-        for process in self.proc_results:
-            handles = []
-
-            for call in process["calls"]:
-                if call["api"].startswith("RegOpenKeyEx") or call["api"].startswith("RegCreateKeyEx"):
-                    registry = 0
-                    subkey = ""
-                    handle = 0
-
-                    for argument in call["arguments"]:
-                        if argument["name"] == "Registry":
-                            registry = int(argument["value"], 16)
-                        elif argument["name"] == "SubKey":
-                            subkey = argument["value"]
-                        elif argument["name"] == "Handle":
-                            handle = int(argument["value"], 16)
-
-                    name = _check_registry(handles, registry, subkey, handle)
-                    if name and name not in keys:
-                        keys.append(name)
-                elif call["api"].startswith("RegCloseKey"):
-                    handle = 0
-
-                    for argument in call["arguments"]:
-                        if argument["name"] == "Handle":
-                            handle = int(argument["value"], 16)
-                    _remove_handle(handles, handle)
-
-                elif call["category"] == "filesystem":
-                    for argument in call["arguments"]:
-                        if argument["name"] == "FileName":
-                            value = argument["value"].strip()
-                            if not value:
-                                continue
-
-                            if value not in files:
-                                files.append(value)
-
-                elif call["category"] == "synchronization":
-                    for argument in call["arguments"]:
-                        if argument["name"] == "MutexName":
-                            value = argument["value"].strip()
-                            if not value:
-                                continue
-
-                            if value not in mutexes:
-                                mutexes.append(value)
-
-        return {"files": files, "keys": keys, "mutexes": mutexes}
-
-class ProcessTree:
-    """Creates process tree."""
-
-    def __init__(self, proc_results):
-        """@param proc_results: enumerated processes information."""
-        self.proc_results = proc_results
-        self.processes = []
-        self.proctree = []
-
-    def gen_proclist(self):
-        """Generate processes list.
-        @return: True.
-        """
-        for entry in self.proc_results:
-            process = {}
-            process["name"] = entry["process_name"]
-            process["pid"] = int(entry["process_id"])
-            process["children"] = []
-            
-            for call in entry["calls"]:
-                if call["api"] == "CreateProcessInternalW":
-                    for argument in call["arguments"]:
-                        if argument["name"] == "ProcessId":
-                            process["children"].append(int(argument["value"]))
-
-            self.processes.append(process)
-
-        return True
-
-    def add_node(self, node, parent_id, tree):
-        """Add a node to a tree.
-        @param node: node to add.
-        @param parent_id: parent node.
-        @param tree: processes tree.
-        @return: boolean with operation success status.
-        """
-        for process in tree:
-            if process["pid"] == parent_id:
-                new = {}
-                new["name"] = node["name"]
-                new["pid"] = node["pid"]
-                new["children"] = []
-                process["children"].append(new)
-                return True
-            self.add_node(node, parent_id, process["children"])
-            
-        return False
-
-    def populate(self, node):
-        """Populate tree.
-        @param node: node to add.
-        @return: True.
-        """
-        for children in node["children"]:
-            for proc in self.processes:
-                if int(proc["pid"]) == int(children):
-                    self.add_node(proc, node["pid"], self.proctree)
-                    self.populate(proc)
-
-        return True
+    def handle_event(self, event):
+        self.processes["%d" % event["pid"]][event["api"]] += 1
 
     def run(self):
-        """Run analysis.
-        @return: results dict or None.
-        """
-        if not self.proc_results or len(self.proc_results) == 0:
-            return None
-    
-        self.gen_proclist()
-        root = {}
-        root["name"] = self.processes[0]["name"]
-        root["pid"] = self.processes[0]["pid"]
-        root["children"] = []
-        self.proctree.append(root)
-        self.populate(self.processes[0])
+        return self.processes
 
-        return self.proctree
+class PlatformInfo(BehaviorHandler):
+    """Provides information about the platform for the collected behavior.
+
+    Not sure if this is really needed, as probably all the info is in the results["info"] area.
+    """
+    key = "platform"
+
+    # self.results = {
+    #     "name": "windows",
+    #     "architecture": "unknown", # look this up in the task / vm info?
+    #     "source": ["monitor", "windows"],
+    # }
 
 class BehaviorAnalysis(Processing):
-    """Behavior Analyzer."""
+    """Behavior Analyzer.
+
+    The behavior key in the results dict will contain both default content keys
+    that contain generic / abstracted analysis info, available on any platform,
+    as well as platform / analyzer specific output.
+
+    Typically the analyzer behavior contains some sort of "process" separation as
+    we're tracking different processes in most cases.
+
+    So this looks roughly like this:
+    "behavior": {
+        "generic": {
+            "processes": [
+                {
+                    "pid": x,
+                    "ppid": y,
+                    "calls": [
+                        {
+                            "function": "foo",
+                            "arguments": {
+                                "a": 1,
+                                "b": 2,
+                            },
+                        },
+                        ...
+                    ]
+                },
+                ...
+            ]
+        }
+        "summary": {
+            "
+        }
+        "platform": {
+            "name": "windows",
+            "architecture": "x86",
+            "source": ["monitor", "windows"],
+            ...
+        }
+    }
+
+    There are several handlers that produce the respective keys / subkeys. Overall
+    the platform / analyzer specific ones parse / process the captured data and yield
+    both their own output, but also a standard structure that is then captured by the
+    "generic" handlers so they can generate the standard result structures.
+
+    The resulting structure contains some iterator onions for the monitored function calls
+    that stream the content when some sink (reporting, signatures) needs it, thereby
+    reducing memory footprint.
+
+    So hopefully in the end each analysis should be fine with 2 passes over the results,
+    once during processing (creating the generic output, summaries, etc) and once
+    during reporting (well once for each report type if multiple are enabled).
+    """
+
+    key = "behavior"
+
+    def _enum_logs(self):
+        """Enumerate all behavior logs."""
+        if not os.path.exists(self.logs_path):
+            log.warning("Analysis results folder does not exist at path %r.", self.logs_path)
+            return
+
+        logs = os.listdir(self.logs_path)
+        if not logs:
+            log.warning("Analysis results folder does not contain any behavior log files.")
+            return
+
+        for fname in logs:
+            path = os.path.join(self.logs_path, fname)
+            if not os.path.isfile(path):
+                log.warning("Behavior log file %r is not a file.", fname)
+                continue
+
+            analysis_size_limit = self.cfg.processing.analysis_size_limit
+            if analysis_size_limit and \
+                    os.stat(path).st_size > analysis_size_limit:
+                # This needs to be a big alert.
+                log.critical("Behavior log file %r is too big, skipped.", fname)
+                continue
+
+            yield path
 
     def run(self):
         """Run analysis.
         @return: results dict.
         """
-        self.key = "behavior"
+        self.cfg = Config()
+        self.state = {}
+
+        # these handlers will be present for any analysis, regardless of platform/format
+        handlers = [
+            GenericBehavior(self),
+            ProcessTree(self),
+            Summary(self),
+            Anomaly(self),
+            ApiStats(self),
+
+            # platform specific stuff
+            WindowsMonitor(self),
+            LinuxSystemTap(self),
+        ]
+
+        # doesn't really work if there's no task, let's rely on the file name for now
+        # # certain handlers only makes sense for a specific platform
+        # # this allows us to use the same filenames/formats without confusion
+        # if self.task.machine.platform == "windows":
+        #     handlers += [
+        #         WindowsMonitor(self),
+        #     ]
+        # elif self.task.machine.platform == "linux":
+        #     handlers += [
+        #         LinuxSystemTap(self),
+        #     ]
+
+        # create a lookup map
+        interest_map = {}
+        for h in handlers:
+            for event_type in h.event_types:
+                if event_type not in interest_map:
+                    interest_map[event_type] = []
+
+                # If available go for the specific event type handler rather
+                # than the generic handle_event.
+                if hasattr(h, "handle_%s_event" % event_type):
+                    fn = getattr(h, "handle_%s_event" % event_type)
+                    interest_map[event_type].append(fn)
+                elif h.handle_event not in interest_map[event_type]:
+                    interest_map[event_type].append(h.handle_event)
+
+        # Each log file should be parsed by one of the handlers. This handler
+        # then yields every event in it which are forwarded to the various
+        # behavior/analysis/etc handlers.
+        for path in self._enum_logs():
+            for handler in handlers:
+                # ... whether it is responsible
+                if not handler.handles_path(path):
+                    continue
+
+                # ... and then let it parse the file
+                for event in handler.parse(path):
+                    # pass down the parsed message to interested handlers
+                    for hhandler in interest_map.get(event["type"], []):
+                        res = hhandler(event)
+                        # We support one layer of "generating" new events,
+                        # which we'll pass on again (in case the handler
+                        # returns some).
+                        if not res:
+                            continue
+
+                        for subevent in res:
+                            for hhandler2 in interest_map.get(subevent["type"], []):
+                                hhandler2(subevent)
 
         behavior = {}
-        behavior["processes"]   = Processes(self.logs_path).run()
-        behavior["processtree"] = ProcessTree(behavior["processes"]).run()
-        behavior["summary"]     = Summary(behavior["processes"]).run()
+
+        for handler in handlers:
+            try:
+                r = handler.run()
+                if not r:
+                    continue
+
+                behavior[handler.key] = r
+            except:
+                log.exception("Failed to run partial behavior class \"%s\"", handler.key)
 
         return behavior

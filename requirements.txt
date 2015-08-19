@@ -1,0 +1,14 @@
+sqlalchemy
+dpkt
+python-magic
+jinja2
+pymongo
+bottle
+pefile
+django
+chardet
+nose
+python-dateutil
+requests
+flask
+alembic
